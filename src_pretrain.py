@@ -14,6 +14,55 @@ import random, pdb, math, copy
 from loss import CrossEntropyLabelSmooth
 from sklearn.metrics import confusion_matrix
 
+class PASTA:
+    def __init__(self, alpha: float = 3, beta: float = 0.25, k: int = 2):
+        self.alpha = alpha
+        self.beta = beta
+        self.k = k
+    
+    def __call__(self, img):
+        img = transforms.ToTensor()(img)
+        fft_src = torch.fft.fftn(img, dim=[-2, -1])
+        amp_src, pha_src = torch.abs(fft_src), torch.angle(fft_src)
+
+        X, Y = amp_src.shape[1:]
+        X_range, Y_range = None, None
+
+        if X % 2 == 1:
+            X_range = np.arange(-1 * (X // 2), (X // 2) + 1)
+        else:
+            X_range = np.concatenate(
+                [np.arange(-1 * (X // 2) + 1, 1), np.arange(0, X // 2)]
+            )
+
+        if Y % 2 == 1:
+            Y_range = np.arange(-1 * (Y // 2), (Y // 2) + 1)
+        else:
+            Y_range = np.concatenate(
+                [np.arange(-1 * (Y // 2) + 1, 1), np.arange(0, Y // 2)]
+            )
+
+        XX, YY = np.meshgrid(Y_range, X_range)
+
+        exp = self.k
+        lin = self.alpha
+        offset = self.beta
+
+        inv = np.sqrt(np.square(XX) + np.square(YY))
+        inv *= (1 / inv.max()) * lin
+        inv = np.power(inv, exp)
+        inv = np.tile(inv, (3, 1, 1))
+        inv += offset
+        prop = np.fft.fftshift(inv, axes=[-2, -1])
+        amp_src = amp_src * np.random.normal(np.ones(prop.shape), prop)
+
+        aug_img = amp_src * torch.exp(1j * pha_src)
+        aug_img = torch.fft.ifftn(aug_img, dim=[-2, -1])
+        aug_img = torch.real(aug_img)
+        aug_img = torch.clip(aug_img, 0, 1)
+        aug_img = transforms.ToPILImage()(aug_img)
+        return aug_img
+
 
 def Entropy(input_):
     bs = input_.size(0)
@@ -37,19 +86,29 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
         param_group['nesterov'] = True
     return optimizer
 
-def image_train(resize_size=256, crop_size=224, alexnet=False):
+def image_train(resize_size=256, crop_size=224, alexnet=False, use_pasta=0):
     if not alexnet:
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                        std=[0.229, 0.224, 0.225])
     else:
         normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
-    return  transforms.Compose([
-          transforms.Resize((resize_size, resize_size)),
-          transforms.RandomCrop(crop_size),
-          transforms.RandomHorizontalFlip(),
-          transforms.ToTensor(),
-          normalize
-      ])
+    if use_pasta == 1:
+        return  transforms.Compose([
+            transforms.Resize((resize_size, resize_size)),
+            transforms.RandomCrop(crop_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
+    else:
+        return  transforms.Compose([
+            PASTA(alpha=3.0, beta=0.25, k=2),
+            transforms.Resize((resize_size, resize_size)),
+            transforms.RandomCrop(crop_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
 
 def image_test(resize_size=256, crop_size=224, alexnet=False):
     if not alexnet:
@@ -89,7 +148,7 @@ def data_load(args):
     tr_txt = txt_src
     #te_txt = txt_src
 
-    dsets["source_tr"] = ImageList(tr_txt, transform=image_train())
+    dsets["source_tr"] = ImageList(tr_txt, transform=image_train(use_pasta=args.use_pasta))
     dset_loaders["source_tr"] = DataLoader(dsets["source_tr"], batch_size=train_bs, shuffle=True, num_workers=args.worker, drop_last=False)
     dsets["source_te"] = ImageList(te_txt, transform=image_test())
     dset_loaders["source_te"] = DataLoader(dsets["source_te"], batch_size=train_bs, shuffle=True, num_workers=args.worker, drop_last=False)
@@ -180,6 +239,12 @@ def train_source(args):
             classifier_loss = CrossEntropyLabelSmooth(
                 num_classes=args.class_num, epsilon=args.smooth)(
                     outputs_source, labels_source)
+            if iter_num % 10 == 0:
+                # print("Epoch: " + str(epoch) + " Iteration: " + str(iter_num) + " Loss: " + str(classifier_loss.item()))
+                log_str = 'Task: {}, Epoch: {}; Iter:{}; Loss = {:.2f}'.format(args.name_src, epoch, iter_num, classifier_loss)
+                args.out_file.write(log_str + '\n')
+                args.out_file.flush()
+                print(log_str)
 
             optimizer.zero_grad()
             classifier_loss.backward()
@@ -191,7 +256,10 @@ def train_source(args):
         netC.eval()
         if args.dset=='visda-2017':
             acc_s_te, acc_list = cal_acc(dset_loaders['source_te'], netF, netB, netC, flag=True)
-            log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name_src, iter_num, max_iter, acc_s_te) + '\n' + acc_list
+            log_str = 'Task: {}, Iter:{}/{}; Source Accuracy = {:.2f}%'.format(args.name_src, iter_num, max_iter, acc_s_te) + '\n' + acc_list
+            log_str += "\n"
+            acc_t_te, acc_t_list = cal_acc(dset_loaders['test'], netF, netB, netC,flag= True)
+            log_str = 'Task: {}, Iter:{}/{}; Target Accuracy = {:.2f}%'.format(args.name_src, iter_num, max_iter, acc_t_te) + '\n' + acc_t_list
         args.out_file.write(log_str + '\n')
         args.out_file.flush()
         print(log_str+'\n')
@@ -279,6 +347,7 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default='weight/source/')
     parser.add_argument('--da', type=str, default='uda')
     parser.add_argument('--trte', type=str, default='val', choices=['full', 'val'])
+    parser.add_argument('--use_pasta', type=int, default=0, choices=[0, 1])
     args = parser.parse_args()
 
     if args.dset == 'office-home':
@@ -297,10 +366,16 @@ if __name__ == "__main__":
     random.seed(SEED)
     # torch.backends.cudnn.deterministic = True
 
-    folder = './data/'
-    args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
-    args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
+    if args.dset == 'visda-2017':
+        args.s_dset_path = 'image_lists/visda/train_imagelist.txt'
+        args.test_dset_path = 'image_lists/visda/validation_imagelist.txt'
+    else: 
+        folder = './data/'
+        args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
+        args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
 
+    if not os.path.exists(args.output):
+        os.mkdir(args.output)
 
     args.output_dir_src = osp.join(args.output, args.da, args.dset, names[args.s][0].upper())
     args.name_src = names[args.s][0].upper()
